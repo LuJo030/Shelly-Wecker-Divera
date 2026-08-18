@@ -1,0 +1,4 @@
+
+SPOTIFY_DEVICE_NAME= <Geräte Name>                    # <-- Starte spotify_test.py
+SPOTIFY_TRACKS=spotify:track:<track_id>               # <-- Trage hier die Song URL von Spotify ein
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback   # <-- Unter Umleitungs-URIs auf https://developer.spotify.com/ eintragen

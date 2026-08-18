@@ -1,3 +1,21 @@
-Hello World
+DIVERA_KEY=<divera_API_key> # <-- API Key kann unter Einstellung des Account erstellt werden
+CHECK_INTERVAL=1 # <-- Wie lange der Abstandt zwichen den Checken eines Alarms izt
 
-comming soon
+SHELLY_IP=<xxx.xxx.xxx.xx> # <-- Shelly IP die vom Router entnommen werden kann
+LIGHT_1_TIME=30            # <-- Switch 1
+LIGHT_2_TIME=30            # <-- Switch 2
+
+TELEGRAM_BOT_TOKEN=<TELEGRAM_BOT_TOKEN> # <-- Telegramm Bot Token kann durch @BotFather erstellt werden
+TELEGRAM_CHAT_ID=<chat_id>              # <-- Starte den Python code und schreibe den erstellten Bot   
+
+BLINK_INTERVAL=0.2                      # <-- Für den Wecher wie der Abstandt des Blinkens der LED sein soll
+ALARM_MAX_SECONDS=300                   # <-- Maximale Wecker Länge
+MATH_TASK_COUNT=5                       # <-- Anzahl der Mathe Aufgaben zum Deaktivieren des Weckers
+
+SPOTIFY_CLIENT_ID=<CLIENT_ID>           # <-- Kann unter https://developer.spotify.com/ erhalten werden
+SPOTIFY_CLIENT_SECRET=<CLIENT_SECRET>   # <-- Kann unter https://developer.spotify.com/ erhalten werden
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback   # <-- Unter Umleitungs-URIs auf https://developer.spotify.com/ eintragen
+
+SPOTIFY_DEVICE_NAME= <Geräte Name>                    # <-- Starte spotify_test.py
+SPOTIFY_VOLUME=55                                     # <-- Lautstärke 1-100
+SPOTIFY_TRACKS=spotify:track:<track_id>               # <-- Trage hier die Song URL von Spotify ein
