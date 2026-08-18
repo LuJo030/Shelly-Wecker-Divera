@@ -10,6 +10,14 @@ import json
 import time
 import os
 
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyOAuth
+except ImportError as exc:
+    raise RuntimeError(
+        "spotipy fehlt. Installiere es mit: python -m pip install spotipy"
+    ) from exc
+
 
 # ============================================================
 # .ENV LADEN
@@ -25,13 +33,22 @@ TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 LIGHT_1_TIME = int(os.getenv("LIGHT_1_TIME", "30"))
 LIGHT_2_TIME = int(os.getenv("LIGHT_2_TIME", "60"))
-
 CHECK_INTERVAL = float(os.getenv("CHECK_INTERVAL", "2"))
 
 BLINK_INTERVAL = float(os.getenv("BLINK_INTERVAL", "0.2"))
 ALARM_MAX_SECONDS = int(os.getenv("ALARM_MAX_SECONDS", "300"))
-
 MATH_TASK_COUNT = int(os.getenv("MATH_TASK_COUNT", "5"))
+
+SPOTIFY_CLIENT_ID = (os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
+SPOTIFY_CLIENT_SECRET = (os.getenv("SPOTIFY_CLIENT_SECRET") or "").strip()
+SPOTIFY_REDIRECT_URI = (
+    os.getenv("SPOTIFY_REDIRECT_URI")
+    or "http://127.0.0.1:8888/callback"
+).strip()
+
+SPOTIFY_DEVICE_NAME = (os.getenv("SPOTIFY_DEVICE_NAME") or "").strip()
+SPOTIFY_TRACKS_RAW = (os.getenv("SPOTIFY_TRACKS") or "").strip()
+SPOTIFY_VOLUME = int(os.getenv("SPOTIFY_VOLUME", "80"))
 
 
 # ============================================================
@@ -46,6 +63,9 @@ if not SHELLY_IP:
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN fehlt in der .env")
+
+if not TELEGRAM_CHAT_ID:
+    print("[HINWEIS] TELEGRAM_CHAT_ID ist noch leer.")
 
 if LIGHT_1_TIME <= 0:
     raise ValueError("LIGHT_1_TIME muss groesser als 0 sein")
@@ -64,6 +84,53 @@ if ALARM_MAX_SECONDS <= 0:
 
 if MATH_TASK_COUNT <= 0:
     raise ValueError("MATH_TASK_COUNT muss groesser als 0 sein")
+
+if not 0 <= SPOTIFY_VOLUME <= 100:
+    raise ValueError("SPOTIFY_VOLUME muss zwischen 0 und 100 liegen")
+
+
+# ============================================================
+# SPOTIFY TRACKS
+# ============================================================
+
+def normalize_spotify_track(value):
+    value = value.strip()
+
+    if not value:
+        return None
+
+    if value.startswith("spotify:track:"):
+        return value
+
+    marker = "open.spotify.com/track/"
+
+    if marker in value:
+        track_id = value.split(marker, 1)[1]
+        track_id = track_id.split("?", 1)[0]
+        track_id = track_id.split("/", 1)[0]
+
+        if track_id:
+            return f"spotify:track:{track_id}"
+
+    return None
+
+
+SPOTIFY_TRACKS = []
+
+for raw_track in SPOTIFY_TRACKS_RAW.split(","):
+    normalized = normalize_spotify_track(raw_track)
+
+    if normalized:
+        SPOTIFY_TRACKS.append(normalized)
+
+
+SPOTIFY_ENABLED = all([
+    SPOTIFY_CLIENT_ID,
+    SPOTIFY_CLIENT_SECRET,
+    SPOTIFY_REDIRECT_URI,
+    SPOTIFY_DEVICE_NAME,
+    SPOTIFY_TRACKS
+])
 
 
 # ============================================================
@@ -203,7 +270,7 @@ def get_alarm_ids():
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Divera-Shelly-Telegram/7.0"
+            "User-Agent": "Divera-Shelly-Telegram-Spotify/1.0"
         }
     )
 
@@ -301,6 +368,262 @@ def divera_worker():
             )
 
         time.sleep(CHECK_INTERVAL)
+
+
+# ============================================================
+# SPOTIFY
+# ============================================================
+
+spotify_lock = threading.RLock()
+spotify_client = None
+
+spotify_alarm_state = {
+    "allowed": False,
+    "playing": False,
+    "device_id": None,
+    "track_uri": None
+}
+
+
+def spotify_init():
+    global spotify_client
+
+    if not SPOTIFY_ENABLED:
+        print(
+            "[SPOTIFY] Deaktiviert. "
+            "Pruefe die SPOTIFY_* Werte in der .env."
+        )
+        return
+
+    try:
+        auth_manager = SpotifyOAuth(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            redirect_uri=SPOTIFY_REDIRECT_URI,
+            scope=(
+                "user-read-playback-state "
+                "user-modify-playback-state"
+            ),
+            cache_path=".spotify_cache",
+            open_browser=True
+        )
+
+        spotify_client = spotipy.Spotify(
+            auth_manager=auth_manager
+        )
+
+        devices = spotify_client.devices().get(
+            "devices",
+            []
+        )
+
+        print("[SPOTIFY] Verbindung erfolgreich.")
+
+        if devices:
+            print("[SPOTIFY] Verfuegbare Geraete:")
+
+            for device in devices:
+                print(
+                    "  - "
+                    f"{device.get('name', 'Unbekannt')} "
+                    f"({device.get('type', 'Unbekannt')})"
+                )
+
+        else:
+            print(
+                "[SPOTIFY] Aktuell keine "
+                "Spotify-Connect-Geraete verfuegbar."
+            )
+
+    except Exception as e:
+        spotify_client = None
+
+        print(
+            f"[SPOTIFY] Initialisierung fehlgeschlagen: {e}"
+        )
+
+
+def spotify_find_target_device():
+    with spotify_lock:
+        client = spotify_client
+
+    if client is None:
+        return None
+
+    try:
+        devices = client.devices().get(
+            "devices",
+            []
+        )
+
+    except Exception as e:
+        print(
+            f"[SPOTIFY] Geraeteliste konnte "
+            f"nicht geladen werden: {e}"
+        )
+        return None
+
+    target = SPOTIFY_DEVICE_NAME.casefold()
+
+    exact_match = None
+    partial_match = None
+
+    for device in devices:
+        if device.get("is_restricted"):
+            continue
+
+        name = (
+            device.get("name")
+            or ""
+        )
+
+        name_folded = name.casefold()
+
+        if name_folded == target:
+            exact_match = device
+            break
+
+        if target in name_folded:
+            partial_match = device
+
+    device = exact_match or partial_match
+
+    if device is None:
+        available_names = [
+            device.get("name", "Unbekannt")
+            for device in devices
+        ]
+
+        print(
+            "[SPOTIFY] Zielgeraet nicht gefunden: "
+            f"{SPOTIFY_DEVICE_NAME}"
+        )
+
+        if available_names:
+            print(
+                "[SPOTIFY] Aktuell verfuegbar: "
+                + ", ".join(available_names)
+            )
+
+        return None
+
+    return device
+
+
+def spotify_prepare_alarm():
+    with spotify_lock:
+        spotify_alarm_state["allowed"] = True
+        spotify_alarm_state["playing"] = False
+        spotify_alarm_state["device_id"] = None
+        spotify_alarm_state["track_uri"] = None
+
+
+def spotify_start_alarm_music():
+    if not SPOTIFY_ENABLED:
+        return
+
+    with spotify_lock:
+        if not spotify_alarm_state["allowed"]:
+            return
+
+        client = spotify_client
+
+    if client is None:
+        print("[SPOTIFY] Keine aktive Spotify-Verbindung.")
+        return
+
+    device = spotify_find_target_device()
+
+    if device is None:
+        return
+
+    device_id = device.get("id")
+
+    if not device_id:
+        print("[SPOTIFY] Zielgeraet hat keine Device-ID.")
+        return
+
+    track_uri = random.choice(
+        SPOTIFY_TRACKS
+    )
+
+    with spotify_lock:
+        if not spotify_alarm_state["allowed"]:
+            return
+
+        spotify_alarm_state["device_id"] = device_id
+        spotify_alarm_state["track_uri"] = track_uri
+
+    try:
+        client.start_playback(
+            device_id=device_id,
+            uris=[track_uri]
+        )
+
+        time.sleep(0.25)
+
+        try:
+            client.volume(
+                SPOTIFY_VOLUME,
+                device_id=device_id
+            )
+
+        except Exception as volume_error:
+            print(
+                "[SPOTIFY] Lautstaerke konnte "
+                f"nicht gesetzt werden: {volume_error}"
+            )
+
+        with spotify_lock:
+            spotify_alarm_state["playing"] = True
+            still_allowed = spotify_alarm_state["allowed"]
+
+        print(
+            f"[SPOTIFY] Song gestartet auf "
+            f"{device.get('name', SPOTIFY_DEVICE_NAME)}"
+        )
+
+        if not still_allowed:
+            spotify_stop_alarm_music()
+
+    except Exception as e:
+        print(
+            f"[SPOTIFY] Wiedergabe konnte "
+            f"nicht gestartet werden: {e}"
+        )
+
+
+def spotify_stop_alarm_music():
+    with spotify_lock:
+        spotify_alarm_state["allowed"] = False
+
+        client = spotify_client
+        device_id = spotify_alarm_state["device_id"]
+        was_playing = spotify_alarm_state["playing"]
+
+        spotify_alarm_state["playing"] = False
+
+    if (
+        client is None
+        or device_id is None
+        or not was_playing
+    ):
+        return
+
+    try:
+        client.pause_playback(
+            device_id=device_id
+        )
+
+        print(
+            "[SPOTIFY] Song gestoppt."
+        )
+
+    except Exception as e:
+        print(
+            f"[SPOTIFY] Song konnte "
+            f"nicht gestoppt werden: {e}"
+        )
 
 
 # ============================================================
@@ -472,11 +795,18 @@ def panel_text():
             or "nicht eingestellt"
         )
 
+    spotify_status = (
+        "AN"
+        if SPOTIFY_ENABLED
+        else "AUS"
+    )
+
     return (
         "ALARMSTEUERUNG\n\n"
         f"DIVERA: {divera_status}\n"
         f"Wecker: {wecker_status}\n"
-        f"Weckerzeit: {wecker_time}\n\n"
+        f"Weckerzeit: {wecker_time}\n"
+        f"Spotify: {spotify_status}\n\n"
         f"Licht 1 DIVERA: {LIGHT_1_TIME} Sekunden\n"
         f"Licht 2 DIVERA: {LIGHT_2_TIME} Sekunden"
     )
@@ -625,7 +955,8 @@ alarm_state = {
     "index": 0,
     "message_id": None,
     "wrong": False,
-    "options": []
+    "options": [],
+    "generation": 0
 }
 
 
@@ -663,7 +994,9 @@ def create_math_task():
     }
 
 
-def create_different_math_task(old_question=None):
+def create_different_math_task(
+    old_question=None
+):
     for _ in range(100):
         new_task = create_math_task()
 
@@ -676,7 +1009,9 @@ def create_different_math_task(old_question=None):
     return create_math_task()
 
 
-def create_answer_options(correct_answer):
+def create_answer_options(
+    correct_answer
+):
     options = {correct_answer}
 
     spread = max(
@@ -685,9 +1020,12 @@ def create_answer_options(correct_answer):
     )
 
     while len(options) < 10:
-        candidate = correct_answer + random.randint(
-            -spread,
-            spread
+        candidate = (
+            correct_answer
+            + random.randint(
+                -spread,
+                spread
+            )
         )
 
         if candidate < 0:
@@ -695,10 +1033,10 @@ def create_answer_options(correct_answer):
 
         options.add(candidate)
 
-    options = list(options)
-    random.shuffle(options)
+    result = list(options)
+    random.shuffle(result)
 
-    return options
+    return result
 
 
 def set_new_current_task(
@@ -723,6 +1061,8 @@ def set_new_current_task(
                 new_task["answer"]
             )
         )
+
+        alarm_state["generation"] += 1
 
 
 def current_math_text():
@@ -756,6 +1096,10 @@ def math_keyboard():
             alarm_state["options"]
         )
 
+        generation = alarm_state[
+            "generation"
+        ]
+
     rows = []
     row = []
 
@@ -763,7 +1107,7 @@ def math_keyboard():
         row.append({
             "text": str(option),
             "callback_data": (
-                f"math:{option}"
+                f"math:{generation}:{option}"
             )
         })
 
@@ -872,6 +1216,7 @@ def blink_worker():
             alarm_state["wrong"] = False
             alarm_state["options"] = []
 
+        spotify_stop_alarm_music()
         delete_math_message()
 
         print(
@@ -903,6 +1248,13 @@ def start_alarm():
 
     alarm_stop_event.clear()
 
+    spotify_prepare_alarm()
+
+    threading.Thread(
+        target=spotify_start_alarm_music,
+        daemon=True
+    ).start()
+
     try:
         sent_message = telegram_send(
             TELEGRAM_CHAT_ID,
@@ -928,10 +1280,16 @@ def start_alarm():
 
 
 def process_math_button(
+    generation,
     selected_answer
 ):
     with alarm_lock:
         if not alarm_state["active"]:
+            return
+
+        if generation != alarm_state[
+            "generation"
+        ]:
             return
 
         task = alarm_state["task"]
@@ -940,6 +1298,7 @@ def process_math_button(
             return
 
         correct_answer = task["answer"]
+        current_index = alarm_state["index"]
 
     if selected_answer != correct_answer:
         set_new_current_task(
@@ -949,9 +1308,18 @@ def process_math_button(
         update_math_message()
         return
 
+    first_correct = (
+        current_index == 0
+    )
+
     finished = False
 
     with alarm_lock:
+        if generation != alarm_state[
+            "generation"
+        ]:
+            return
+
         alarm_state["index"] += 1
         alarm_state["wrong"] = False
 
@@ -965,8 +1333,19 @@ def process_math_button(
             alarm_state["options"] = []
             finished = True
 
+    if first_correct:
+        threading.Thread(
+            target=spotify_stop_alarm_music,
+            daemon=True
+        ).start()
+
     if finished:
         alarm_stop_event.set()
+
+        threading.Thread(
+            target=spotify_stop_alarm_music,
+            daemon=True
+        ).start()
 
         delete_math_message()
 
@@ -995,6 +1374,12 @@ def stop_alarm_manually():
 
     if was_active:
         alarm_stop_event.set()
+
+        threading.Thread(
+            target=spotify_stop_alarm_music,
+            daemon=True
+        ).start()
+
         delete_math_message()
 
 
@@ -1097,15 +1482,20 @@ def telegram_callback_worker(callback):
 
     if alarm_active:
         if data.startswith("math:"):
+            parts = data.split(":")
+
+            if len(parts) != 3:
+                return
+
             try:
-                selected_answer = int(
-                    data.split(":", 1)[1]
-                )
+                generation = int(parts[1])
+                selected_answer = int(parts[2])
 
             except ValueError:
                 return
 
             process_math_button(
+                generation,
                 selected_answer
             )
 
@@ -1441,31 +1831,58 @@ def telegram_worker():
 # ============================================================
 
 print("======================================")
-print(" DIVERA + TELEGRAM + SHELLY")
+print(" DIVERA + TELEGRAM + SHELLY + SPOTIFY")
 print("======================================")
 print()
 
 print(f"Shelly: {SHELLY_IP}")
+
 print(
     f"DIVERA Licht 1: "
     f"{LIGHT_1_TIME} Sekunden"
 )
+
 print(
     f"DIVERA Licht 2: "
     f"{LIGHT_2_TIME} Sekunden"
 )
+
 print(
     f"DIVERA Intervall: "
     f"{CHECK_INTERVAL} Sekunden"
 )
+
 print(
     f"Wecker Blinkintervall: "
     f"{BLINK_INTERVAL} Sekunden"
 )
+
 print(
     f"Matheaufgaben: "
     f"{MATH_TASK_COUNT}"
 )
+
+print(
+    f"Spotify: "
+    f"{'AN' if SPOTIFY_ENABLED else 'AUS'}"
+)
+
+if SPOTIFY_ENABLED:
+    print(
+        f"Spotify Zielgeraet: "
+        f"{SPOTIFY_DEVICE_NAME}"
+    )
+
+    print(
+        f"Spotify Songs: "
+        f"{len(SPOTIFY_TRACKS)}"
+    )
+
+    print(
+        f"Spotify Lautstaerke: "
+        f"{SPOTIFY_VOLUME}%"
+    )
+
 print()
 
 with state_lock:
@@ -1497,6 +1914,8 @@ with state_lock:
 
 print()
 
+spotify_init()
+
 threading.Thread(
     target=divera_worker,
     daemon=True
@@ -1512,6 +1931,7 @@ threading.Thread(
     daemon=True
 ).start()
 
+print()
 print("System laeuft.")
 print()
 
@@ -1521,6 +1941,9 @@ try:
 
 except KeyboardInterrupt:
     alarm_stop_event.set()
+
+    spotify_stop_alarm_music()
+
     set_both_lights(False)
 
     print()
