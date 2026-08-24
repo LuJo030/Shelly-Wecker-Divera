@@ -5,6 +5,7 @@
    - Divera Alarm 
      - Alarmierung durch Divera erfolgt und wird erkannt
      - Licht wird eingeschaltet
+     - Voralarm Löchzug sound wird Abgespielt
      - Licht schaltet sich nach 30 sek aus
 
    - Wecker Funktion
